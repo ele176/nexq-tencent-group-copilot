@@ -1,0 +1,74 @@
+# Dependencies
+node_modules/
+target/
+.tools/
+.git-codex-backup/
+.tmp/
+.playwright-mcp/
+.planning/
+.emdash.json
+.impeccable.md
+上传到GitHub.bat
+
+# 私有笔记（不上传）
+腾讯智慧行业群面Copilot方案.md
+Fix STT language.md
+
+# Build output
+dist/
+.astro/
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+
+# Database
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/
+WixTools/
+
+# Tauri updater signing key
+src-tauri/.tauri-private-key
+
+# Recordings
+recordings/
+
+# Superpowers
+.superpowers/
+
+# Claude Code
+CLAUDE.md
+.claude/
+docs/development
+docs/superpowers
+
+# Logs
+*.log
+npm-debug.log*
+
+# Package manager locks (keep package-lock.json, ignore others)
+yarn.lock
+pnpm-lock.yaml
+bun.lockb
