@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use tauri::{AppHandle, Emitter, Manager, State};
-
 use crate::group_copilot::{spawn_scheduler, GroupCopilotEngine, GroupState, GroupStatusPayload};
 use crate::state::AppState;
 
@@ -18,6 +17,18 @@ pub async fn group_copilot_start(
     // 个人背景：取 Context 文档全文（简历/JD 等）作为可引用素材
     let personal_context = load_personal_context(&app_handle);
 
+    // 快照目录：<app_data_dir>/group_copilot/
+    let snapshot_dir = app_handle
+        .path()
+        .app_data_dir()
+        .ok()
+        .map(|p| p.join("group_copilot"));
+
+    let start_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
     let engine_arc: Arc<std::sync::Mutex<GroupCopilotEngine>> = state
         .group_copilot
         .clone()
@@ -25,7 +36,13 @@ pub async fn group_copilot_start(
 
     {
         let mut engine = engine_arc.lock().map_err(|e| e.to_string())?;
-        engine.reset(case_question, duration_minutes.saturating_mul(60), personal_context);
+        engine.reset(
+            case_question,
+            duration_minutes.saturating_mul(60),
+            personal_context,
+            start_unix_ms,
+            snapshot_dir,
+        );
     }
 
     spawn_scheduler(engine_arc.clone(), app_handle.clone());
@@ -99,7 +116,26 @@ pub async fn group_copilot_get_state(
     Ok(None)
 }
 
-/// 从 Context 资源聚合个人背景文本（限制长度防止 token 爆炸）。
+/// 读取某场群面的全部状态快照（JSONL），供会后复盘。
+#[tauri::command]
+pub async fn group_copilot_list_snapshots(
+    start_unix_ms: u64,
+    app_handle: AppHandle,
+) -> Result<Vec<String>, String> {
+    let dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|_| "无法获取数据目录".to_string())?
+        .join("group_copilot");
+    let path = dir.join(format!("group_copilot_{}.jsonl", start_unix_ms));
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    Ok(text.lines().filter(|l| !l.trim().is_empty()).map(String::from).collect())
+}
+
+/// 从 Context 聚合个人背景文本（限制长度防止 token 爆炸）。
 fn load_personal_context(app_handle: &AppHandle) -> String {
     let app_state: tauri::State<AppState> = app_handle.state::<AppState>();
     if let Some(ctx) = app_state.context.as_ref() {

@@ -104,6 +104,10 @@ pub struct GroupCopilotEngine {
     pub duration_secs: u64,
     pub started_at: Option<Instant>,
     pub personal_context: String,
+    /// 会话开始时的 Unix 毫秒时间戳（用于快照文件命名）。
+    pub start_unix_ms: u64,
+    /// 快照目录（app_data_dir/group_copilot）；None 则不落盘。
+    pub snapshot_dir: Option<std::path::PathBuf>,
 
     /// 全部已确认片段（完整 transcript，不删减）。
     pub segments: Vec<TranscriptItem>,
@@ -130,6 +134,8 @@ impl GroupCopilotEngine {
             duration_secs: 1800,
             started_at: None,
             personal_context: String::new(),
+            start_unix_ms: 0,
+            snapshot_dir: None,
             segments: Vec::new(),
             last_analyzed_seq: 0,
             revision: 0,
@@ -141,13 +147,22 @@ impl GroupCopilotEngine {
         }
     }
 
-    pub fn reset(&mut self, case_question: String, duration_secs: u64, personal_context: String) {
+    pub fn reset(
+        &mut self,
+        case_question: String,
+        duration_secs: u64,
+        personal_context: String,
+        start_unix_ms: u64,
+        snapshot_dir: Option<std::path::PathBuf>,
+    ) {
         self.enabled = true;
         self.stop_flag = Arc::new(AtomicBool::new(false));
         self.case_question = case_question;
         self.duration_secs = duration_secs;
         self.started_at = Some(Instant::now());
         self.personal_context = personal_context;
+        self.start_unix_ms = start_unix_ms;
+        self.snapshot_dir = snapshot_dir;
         self.segments.clear();
         self.last_analyzed_seq = 0;
         self.revision = 0;
@@ -260,13 +275,28 @@ pub fn spawn_scheduler(state: Arc<Mutex<GroupCopilotEngine>>, app_handle: tauri:
             if let Ok(mut engine) = state.lock() {
                 engine.in_flight = false;
                 match result {
-                    Ok(new_state) => {
+                    Ok(mut new_state) => {
+                        // 建议去重：与上一条建议高度相似时，视为未推进讨论——
+                        // 不覆盖旧建议（避免重复刷屏），也不重置失效计时。
+                        let new_suggestion = new_state.decision.suggestion.trim().to_string();
+                        let duplicate = !new_suggestion.is_empty()
+                            && !engine.last_suggestion.is_empty()
+                            && bigram_similarity(&new_suggestion, &engine.last_suggestion) > 0.82;
+
+                        if duplicate {
+                            log::info!("[GroupCopilot] suggestion deduplicated (similar to previous)");
+                            if let Some(prev) = engine.state.as_ref() {
+                                new_state.decision.suggestion = prev.decision.suggestion.clone();
+                            }
+                        }
+                        if !duplicate && !new_suggestion.is_empty() {
+                            engine.last_suggestion = new_suggestion;
+                        }
+
                         engine.revision += 1;
                         engine.last_analyzed_seq = new_state.transcript_seq;
-                        if !new_state.decision.suggestion.is_empty() {
-                            engine.last_suggestion = new_state.decision.suggestion.clone();
-                        }
                         engine.state = Some(new_state.clone());
+                        append_snapshot(&engine, &new_state);
                         let _ = app_handle.emit("group_copilot_update", &new_state);
                         let _ = app_handle.emit(
                             "group_copilot_status",
@@ -541,4 +571,58 @@ fn build_user_payload(job: &GroupJob) -> String {
         "remaining_seconds": job.remaining,
     })
     .to_string()
+}
+
+// ── 建议相似度（bigram Dice 系数）────────────────────────
+
+fn bigram_set(s: &str) -> std::collections::HashSet<Vec<char>> {
+    let chars: Vec<char> = s.chars().filter(|c| !c.is_whitespace()).collect();
+    if chars.len() < 2 {
+        let mut set = std::collections::HashSet::new();
+        if !chars.is_empty() {
+            set.insert(chars.clone());
+        }
+        return set;
+    }
+    chars.windows(2).map(|w| w.to_vec()).collect()
+}
+
+pub fn bigram_similarity(a: &str, b: &str) -> f64 {
+    let set_a = bigram_set(a);
+    let set_b = bigram_set(b);
+    if set_a.is_empty() || set_b.is_empty() {
+        return 0.0;
+    }
+    let inter = set_a.intersection(&set_b).count();
+    (2.0 * inter as f64) / ((set_a.len() + set_b.len()) as f64)
+}
+
+// ── 会话快照（JSONL 追加写，用于会后复盘）────────────────
+// 每次成功分析追加一行：{"saved_at_ms":..., "revision":..., "state":{...}}
+// 文件：app_data_dir/group_copilot/group_copilot_<会话开始毫秒>.jsonl
+
+fn append_snapshot(engine: &GroupCopilotEngine, state: &GroupState) {
+    let Some(dir) = engine.snapshot_dir.as_ref() else {
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        log::warn!("[GroupCopilot] snapshot dir create failed: {}", e);
+        return;
+    }
+    let path = dir.join(format!("group_copilot_{}.jsonl", engine.start_unix_ms));
+    let entry = serde_json::json!({
+        "saved_at_ms": now_ms(),
+        "revision": state.revision,
+        "transcript_seq": state.transcript_seq,
+        "state": state,
+    });
+    use std::io::Write;
+    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut f) => {
+            if let Err(e) = writeln!(f, "{}", entry) {
+                log::warn!("[GroupCopilot] snapshot write failed: {}", e);
+            }
+        }
+        Err(e) => log::warn!("[GroupCopilot] snapshot open failed: {}", e),
+    }
 }

@@ -550,6 +550,7 @@ pub fn run() {
             group_copilot_commands::group_copilot_push_segment,
             group_copilot_commands::group_copilot_force,
             group_copilot_commands::group_copilot_get_state,
+            group_copilot_commands::group_copilot_list_snapshots,
             // == COMMANDS: context ==
             context_commands::load_context_file,
             context_commands::remove_context_file,
