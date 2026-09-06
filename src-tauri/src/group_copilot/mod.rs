@@ -120,6 +120,8 @@ pub struct GroupCopilotEngine {
 
     pub in_flight: bool,
     pub last_request_at: Option<Instant>,
+    /// 上次成功分析的时间（用于 15s 强制刷新判断）。
+    pub last_analyzed_at: Option<Instant>,
     /// 热键强制标记（单并发内排队）。
     pub force_requested: bool,
     pub last_suggestion: String,
@@ -142,6 +144,7 @@ impl GroupCopilotEngine {
             state: None,
             in_flight: false,
             last_request_at: None,
+            last_analyzed_at: None,
             force_requested: false,
             last_suggestion: String::new(),
         }
@@ -169,6 +172,7 @@ impl GroupCopilotEngine {
         self.state = None;
         self.in_flight = false;
         self.last_request_at = None;
+        self.last_analyzed_at = None;
         self.force_requested = false;
         self.last_suggestion = String::new();
     }
@@ -195,27 +199,40 @@ impl GroupCopilotEngine {
 
 // ── 调度循环 ──────────────────────────────────────────────
 
-/// 启动调度循环（每秒 tick 一次，直到 stop_flag）。
-pub fn spawn_scheduler(state: Arc<Mutex<GroupCopilotEngine>>, app_handle: tauri::AppHandle) {
+/// 启动调度循环（每秒 tick 一次，直到捕获的 stop_flag 置位）。
+/// 注意：stop_flag 必须由调用方捕获传入——若读 engine.stop_flag 字段，
+/// reset() 替换字段后旧循环将永远看不到停止信号而累积。
+pub fn spawn_scheduler(
+    state: Arc<Mutex<GroupCopilotEngine>>,
+    app_handle: tauri::AppHandle,
+    stop_flag: Arc<AtomicBool>,
+) {
     tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(1000));
         loop {
             interval.tick().await;
 
+            // 停止信号用捕获的 Arc 判断（不依赖锁）
+            if stop_flag.load(Ordering::SeqCst) {
+                break;
+            }
+
             // 快照本轮决策参数后立刻释放锁
             let job = {
                 let mut engine = match state.lock() {
                     Ok(e) => e,
-                    Err(_) => continue,
+                    Err(p) => {
+                        // 锁中毒：恢复后重试（引擎状态可能部分无效但无碍整体流程）
+                        p.into_inner().stop_flag.store(true, Ordering::SeqCst);
+                        break;
+                    }
                 };
-                if engine.stop_flag.load(Ordering::SeqCst) {
-                    break;
-                }
                 if !engine.enabled || engine.in_flight {
                     continue;
                 }
                 let dirty = (engine.segments.len() as u64) > engine.last_analyzed_seq;
                 if !dirty {
+                    // 无新内容：force 请求挂起（保留到新片段到来），不消费
                     continue;
                 }
 
@@ -225,21 +242,17 @@ pub fn spawn_scheduler(state: Arc<Mutex<GroupCopilotEngine>>, app_handle: tauri:
                     .unwrap_or(Duration::from_secs(u64::MAX));
 
                 let force = engine.force_requested;
+                // 最小间隔 10s：两次自动分析之间至少隔 10s（force 绕过）
                 let min_interval_hit = since_last >= Duration::from_secs(10);
-                // 连续讨论时有新内容：距上次成功分析超过 15s 且距上次请求超过 3s，提前刷新
-                let max_refresh_hit = since_last >= Duration::from_secs(3)
-                    && engine
-                        .state
-                        .as_ref()
-                        .map(|_| engine.last_request_at.is_some())
-                        .unwrap_or(false)
-                    && engine.last_request_at.unwrap().elapsed() < Duration::from_secs(10)
+                // 15s 强制刷新：距上次"成功分析"≥15s 且讨论仍活跃（最后一条发言在 15s 内）
+                let max_refresh_hit = !force
+                    && engine.last_analyzed_at.is_some()
+                    && engine.last_analyzed_at.unwrap().elapsed() >= Duration::from_secs(15)
                     && engine
                         .segments
                         .last()
-                        .map(|s| s.timestamp_ms)
-                        .unwrap_or(0)
-                        .saturating_sub(now_ms().saturating_sub(15_000)) > 0;
+                        .map(|s| now_ms().saturating_sub(s.timestamp_ms) <= 15_000)
+                        .unwrap_or(false);
 
                 if !(force || engine.last_request_at.is_none() || min_interval_hit || max_refresh_hit)
                 {
@@ -274,6 +287,10 @@ pub fn spawn_scheduler(state: Arc<Mutex<GroupCopilotEngine>>, app_handle: tauri:
 
             if let Ok(mut engine) = state.lock() {
                 engine.in_flight = false;
+                // 请求期间被 Stop：丢弃结果，直接退出循环
+                if stop_flag.load(Ordering::SeqCst) || !engine.enabled {
+                    break;
+                }
                 match result {
                     Ok(mut new_state) => {
                         // 建议去重：与上一条建议高度相似时，视为未推进讨论——
@@ -295,6 +312,7 @@ pub fn spawn_scheduler(state: Arc<Mutex<GroupCopilotEngine>>, app_handle: tauri:
 
                         engine.revision += 1;
                         engine.last_analyzed_seq = new_state.transcript_seq;
+                        engine.last_analyzed_at = Some(Instant::now());
                         engine.state = Some(new_state.clone());
                         append_snapshot(&engine, &new_state);
                         let _ = app_handle.emit("group_copilot_update", &new_state);
@@ -377,7 +395,11 @@ async fn run_analysis(
         let app_state = app_handle.state::<crate::state::AppState>();
         if let Some(creds) = app_state.credentials.as_ref() {
             let mgr = creds.lock().map_err(|e| e.to_string())?;
-            mgr.get_key(&provider_type).unwrap_or(None)
+            // 凭据读取失败与"未配置"是两回事——前者直接报错，避免无凭证 401 难排查
+            match mgr.get_key(&provider_type) {
+                Ok(k) => k,
+                Err(e) => return Err(format!("读取 API 凭据失败: {}", e)),
+            }
         } else {
             None
         }
@@ -398,10 +420,14 @@ async fn run_analysis(
         ]
     });
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(45))
-        .build()
-        .map_err(|e| e.to_string())?;
+    // 复用连接池：Client 内部是 Arc，每次分析重建会重新 TLS 握手（200-500ms 损耗）
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(45))
+            .build()
+            .unwrap_or_default()
+    });
 
     let mut request = client
         .post(format!("{}/chat/completions", base_url))
@@ -454,10 +480,13 @@ async fn run_analysis(
 }
 
 fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n {
+    // 按字符边界截断——直接字节切片 &s[..n] 在多字节 UTF-8（中文）上会 panic，
+    // 且 panic 发生在调度任务内会导致引擎僵死（in_flight 永不复位）。
+    if s.chars().count() <= n {
         s.to_string()
     } else {
-        format!("{}...", &s[..n])
+        let cut: String = s.chars().take(n).collect();
+        format!("{}...", cut)
     }
 }
 
@@ -484,7 +513,7 @@ fn parse_state_json(content: &str) -> Result<RawGroupState, String> {
 fn build_final_state(
     state: &Arc<Mutex<GroupCopilotEngine>>,
     raw: RawGroupState,
-    _job: &GroupJob,
+    job: &GroupJob,
 ) -> Result<GroupState, String> {
     let decision = raw.decision.ok_or("缺少 decision 字段")?;
 
@@ -494,10 +523,24 @@ fn build_final_state(
         suggestion = suggestion.chars().take(160).collect();
     }
 
+    // 关键：transcript_seq 必须是"本次实际分析到的最大 seq"（job 快照），
+    // 而不是响应返回时的 segments.len()——否则请求期间新到的片段
+    // 会被错误标记为已分析，永久跳过增量分析。
+    let analyzed_upto = job
+        .new_items
+        .last()
+        .map(|s| s.seq)
+        .unwrap_or_else(|| {
+            job.previous_state
+                .as_ref()
+                .map(|s| s.transcript_seq)
+                .unwrap_or(0)
+        });
+
     let engine = state.lock().map_err(|e| e.to_string())?;
     Ok(GroupState {
         revision: engine.revision + 1,
-        transcript_seq: engine.segments.len() as u64,
+        transcript_seq: analyzed_upto,
         stage: raw.stage,
         situation: raw.situation,
         consensus: raw.consensus,

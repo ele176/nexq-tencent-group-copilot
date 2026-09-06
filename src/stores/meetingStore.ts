@@ -272,15 +272,16 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
         }).catch(() => {});
       });
 
-      // 8. 群面 Copilot：若挂起参数存在则启动战术引擎
+      // 8. 群面 Copilot：take 语义——读出即清空，无论成功与否，
+      // 防止失败的会议把旧题目/时长泄漏到下次（tray/Ctrl+M 路径不经过弹窗）
       try {
         const { useGroupCopilotStore } = await import("./groupCopilotStore");
         const pending = get().pendingGroupCopilot;
+        set({ pendingGroupCopilot: null });
         if (pending?.enabled) {
           await useGroupCopilotStore
             .getState()
             .start(pending.caseQuestion, pending.durationMinutes);
-          set({ pendingGroupCopilot: null });
         }
       } catch (err) {
         console.warn("[meetingStore] Group copilot start failed:", err);
@@ -295,12 +296,11 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
     const state = get();
     const meeting = state.activeMeeting;
 
-    // 0. 停止群面 Copilot（若开启）
+    // 0. 停止群面 Copilot（无条件调用——后端幂等；launcher/overlay 双窗口
+    // store 独立，不能依赖本窗口的 active 标志判断）
     try {
       const { useGroupCopilotStore } = await import("./groupCopilotStore");
-      if (useGroupCopilotStore.getState().active) {
-        await useGroupCopilotStore.getState().stop();
-      }
+      await useGroupCopilotStore.getState().stop();
     } catch { /* non-critical */ }
 
     // 1. Stop timer

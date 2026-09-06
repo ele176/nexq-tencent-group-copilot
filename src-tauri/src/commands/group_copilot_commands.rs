@@ -36,6 +36,9 @@ pub async fn group_copilot_start(
 
     {
         let mut engine = engine_arc.lock().map_err(|e| e.to_string())?;
+        // 先停掉旧调度循环（reset 会替换 stop_flag 字段，
+        // 旧循环持有的是旧 Arc——必须先置位让它退出）
+        engine.stop_flag.store(true, std::sync::atomic::Ordering::SeqCst);
         engine.reset(
             case_question,
             duration_minutes.saturating_mul(60),
@@ -45,9 +48,14 @@ pub async fn group_copilot_start(
         );
     }
 
-    spawn_scheduler(engine_arc.clone(), app_handle.clone());
+    // reset 后取新 flag 传入
+    let stop_flag = {
+        let engine = engine_arc.lock().map_err(|e| e.to_string())?;
+        engine.stop_flag.clone()
+    };
+    spawn_scheduler(engine_arc.clone(), app_handle.clone(), stop_flag);
 
-    let _ = app_handle.emit_status("analyzing", "群面 Copilot 已启动");
+    let _ = app_handle.emit_status("started", "群面 Copilot 已启动");
     log::info!("[GroupCopilot] started");
     Ok(())
 }

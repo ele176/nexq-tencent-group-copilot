@@ -62,8 +62,44 @@ interface GroupCopilotState {
 
 const SUGGESTION_TTL_MS = 20_000;
 
-let unlisteners: UnlistenFn[] = [];
 let listenersStarted = false;
+let expiryTimer: ReturnType<typeof setInterval> | null = null;
+
+/** 全局事件监听（幂等；两个 Tauri 窗口各自加载本模块，都会注册）。
+ * active 状态以后端为权威：由 group_copilot_status 事件驱动，
+ * 避免 launcher/overlay 双窗口 Zustand 状态不同步。 */
+export function startGlobalListeners() {
+  if (listenersStarted) return;
+  listenersStarted = true;
+
+  listen<GroupState>("group_copilot_update", (e) => {
+    useGroupCopilotStore.getState().applyGroupState(e.payload);
+  }).then((u) => unlisteners.push(u));
+
+  listen<{ status: string; message: string }>("group_copilot_status", (e) => {
+    const s = e.payload.status;
+    // 后端启停是权威信号：双窗口同步 active
+    if (s === "started") {
+      useGroupCopilotStore.setState({ active: true, status: "analyzing" });
+      return;
+    }
+    if (s === "stopped") {
+      useGroupCopilotStore.setState({ active: false, status: "idle" });
+      return;
+    }
+    useGroupCopilotStore.getState().setStatus(
+      s as GroupCopilotState["status"],
+      e.payload.message
+    );
+  }).then((u) => unlisteners.push(u));
+
+  // 20 秒失效定时器
+  expiryTimer = setInterval(() => {
+    useGroupCopilotStore.getState().tickExpiry();
+  }, 1000);
+}
+
+let unlisteners: UnlistenFn[] = [];
 
 export const useGroupCopilotStore = create<GroupCopilotState>((set, get) => ({
   active: false,
@@ -109,8 +145,8 @@ export const useGroupCopilotStore = create<GroupCopilotState>((set, get) => ({
 
   start: async (caseQuestion, durationMinutes) => {
     get().setMeta(caseQuestion, durationMinutes);
-    set({ active: true, groupState: null, status: "analyzing", statusMessage: "", suggestionExpired: false, suggestionShownAt: null });
-    startGlobalListeners();
+    // active 由后端 group_copilot_status(started) 事件置位（双窗口同步）
+    set({ groupState: null, status: "analyzing", statusMessage: "", suggestionExpired: false, suggestionShownAt: null });
     await invoke("group_copilot_start", {
       caseQuestion,
       durationMinutes,
@@ -118,11 +154,13 @@ export const useGroupCopilotStore = create<GroupCopilotState>((set, get) => ({
   },
 
   stop: async () => {
-    set({ active: false, status: "idle" });
     try {
       await invoke("group_copilot_stop");
     } catch {
       /* ignore */
+    } finally {
+      // 后端 stopped 事件会同步置 active=false；这里兜底（事件丢失时）
+      useGroupCopilotStore.setState({ active: false, status: "idle" });
     }
   },
 
@@ -150,24 +188,3 @@ export const useGroupCopilotStore = create<GroupCopilotState>((set, get) => ({
   },
 }));
 
-/** 全局事件监听（只启动一次）。 */
-export function startGlobalListeners() {
-  if (listenersStarted) return;
-  listenersStarted = true;
-
-  listen<GroupState>("group_copilot_update", (e) => {
-    useGroupCopilotStore.getState().applyGroupState(e.payload);
-  }).then((u) => unlisteners.push(u));
-
-  listen<{ status: string; message: string }>("group_copilot_status", (e) => {
-    useGroupCopilotStore.getState().setStatus(
-      e.payload.status as GroupCopilotState["status"],
-      e.payload.message
-    );
-  }).then((u) => unlisteners.push(u));
-
-  // 20 秒失效定时器
-  setInterval(() => {
-    useGroupCopilotStore.getState().tickExpiry();
-  }, 1000);
-}

@@ -110,6 +110,11 @@ function App() {
   // Detect which Tauri window we're in ("launcher" or "overlay")
   const [windowLabel, setWindowLabel] = useState<string>("");
   useEffect(() => {
+    // 群面 Copilot 事件监听：两个窗口都要注册（active 由后端状态事件驱动，
+    // 双窗口 Zustand 独立无法互相同步）
+    import("./stores/groupCopilotStore").then(({ startGlobalListeners }) => {
+      startGlobalListeners();
+    }).catch(() => {});
     import("@tauri-apps/api/webviewWindow").then(({ getCurrentWebviewWindow }) => {
       const label = getCurrentWebviewWindow().label;
       setWindowLabel(label);
