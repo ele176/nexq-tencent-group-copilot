@@ -574,6 +574,7 @@ fn build_user_payload(job: &GroupJob) -> String {
 }
 
 // ── 建议相似度（bigram Dice 系数）────────────────────────
+// 用于本地去重：两条建议字符二元组重合度 > 0.82 视为高度重复。
 
 fn bigram_set(s: &str) -> std::collections::HashSet<Vec<char>> {
     let chars: Vec<char> = s.chars().filter(|c| !c.is_whitespace()).collect();

@@ -118,7 +118,7 @@ export function MeetingSetupModal({ open, onStart, onCancel }: MeetingSetupModal
       aria-modal="true"
       aria-label="会议设置"
     >
-      <div className="w-[420px] rounded-2xl border border-border/40 bg-card shadow-2xl overflow-hidden">
+      <div className="w-[420px] max-h-[90vh] overflow-y-auto rounded-2xl border border-border/40 bg-card shadow-2xl">
 
         {/* ── HEADER ── */}
         <div className="flex items-center justify-between border-b border-border/20 px-5 py-4">
