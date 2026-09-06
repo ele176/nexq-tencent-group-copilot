@@ -16,6 +16,7 @@ const ACTION_COLORS: Record<string, string> = {
 export function GroupCopilotPanel() {
   const groupState = useGroupCopilotStore((s) => s.groupState);
   const status = useGroupCopilotStore((s) => s.status);
+  const statusMessage = useGroupCopilotStore((s) => s.statusMessage);
   const suggestionExpired = useGroupCopilotStore((s) => s.suggestionExpired);
   const caseQuestion = useGroupCopilotStore((s) => s.caseQuestion);
   const durationMinutes = useGroupCopilotStore((s) => s.durationMinutes);
@@ -34,6 +35,31 @@ export function GroupCopilotPanel() {
   const decision = groupState?.decision;
   const showSuggestion =
     decision?.should_speak && decision.suggestion && !suggestionExpired;
+
+  // 错误信息友好化：把后端原始报错翻译成用户能看懂的提示 + 排查动作
+  const friendlyError = (() => {
+    if (status !== "error" || !statusMessage) return null;
+    const msg = statusMessage;
+    if (/LLM router not initialized|No active LLM provider|No active model/i.test(msg)) {
+      return { title: "AI 服务商未配置", detail: "请在 设置 → LLM 服务商 选择服务商、填入 API 密钥并选择模型" };
+    }
+    if (/401|403|AuthError|Authentication|密钥/i.test(msg)) {
+      return { title: "API 密钥无效或过期", detail: "请在 设置 → LLM 服务商 重新测试连接" };
+    }
+    if (/429|rate.?limit/i.test(msg)) {
+      return { title: "请求频率超限", detail: "稍等片刻会自动重试；也可按右上角按钮手动分析" };
+    }
+    if (/群面模式暂不支持该 LLM 服务商/i.test(msg)) {
+      return { title: "当前 LLM 服务商不支持群面引擎", detail: "请在设置中切换到 OpenRouter / Groq / OpenAI / 本地模型" };
+    }
+    if (/timeout|timed? ?out|connection|网络/i.test(msg)) {
+      return { title: "网络连接失败", detail: "检查网络后按右上角按钮重试" };
+    }
+    if (/JSON 解析失败|响应中|缺少/i.test(msg)) {
+      return { title: "AI 返回格式异常", detail: "多为模型太弱导致，建议换 Gemini / GPT 系模型；会自动在下一轮重试" };
+    }
+    return { title: "分析失败", detail: msg.slice(0, 120) };
+  })();
 
   const mm = String(Math.floor(remaining / 60)).padStart(2, "0");
   const ss = String(remaining % 60).padStart(2, "0");
@@ -59,13 +85,33 @@ export function GroupCopilotPanel() {
           </span>
           <button
             onClick={() => force()}
-            title="立即分析（Space 也可触发）"
+            title="立即分析（全局热键 Ctrl+Shift+G，会议中也能触发）"
             className="rounded-md border border-border/40 p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           >
             <RefreshCw className="h-3 w-3" />
           </button>
         </div>
       </div>
+
+      {/* 错误横幅：分析失败时醒目展示原因与排查建议 */}
+      {friendlyError && (
+        <div className="shrink-0 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2">
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-[12px] font-semibold text-destructive">
+              {friendlyError.title}
+            </p>
+            <button
+              onClick={() => force()}
+              className="shrink-0 rounded-md border border-destructive/30 px-2 py-0.5 text-[10px] font-medium text-destructive transition-colors hover:bg-destructive/20"
+            >
+              重试
+            </button>
+          </div>
+          <p className="mt-0.5 text-[11px] leading-relaxed break-all text-destructive/80">
+            {friendlyError.detail}
+          </p>
+        </div>
+      )}
 
       {/* 局势 */}
       <Section label="局势">
@@ -126,7 +172,7 @@ export function GroupCopilotPanel() {
             <p className="text-[11px] text-muted-foreground/60">
               {decision && !decision.should_speak
                 ? decision.situation || "当前时机不适合发言"
-                : "发言结束后会自动给出建议"}
+                : "发言结束后自动分析；在会议中按 Ctrl+Shift+G 可随时手动触发"}
             </p>
           </div>
         )}

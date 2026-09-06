@@ -55,6 +55,18 @@ export function useGlobalShortcut() {
             }
           },
         },
+        {
+          // 群面热键：在任何应用（如全屏腾讯会议）下强制触发战术引擎分析
+          key: "CmdOrCtrl+Shift+G",
+          handler: (event) => {
+            if (event.state === "Pressed") {
+              const group = useGroupCopilotStore.getState();
+              if (group.active) {
+                group.force().catch(() => {});
+              }
+            }
+          },
+        },
       ];
 
       for (const { key, handler } of defs) {
